@@ -8,7 +8,7 @@ import sys
 import tempfile
 import time
 
-BIN = "/usr/local/bin/npu-lease"
+BIN = os.getenv("NPU_LEASE_TEST_BIN", "/usr/local/bin/npu-lease")
 ACL = """
 import ctypes as c
 import os
@@ -177,6 +177,43 @@ with tempfile.TemporaryDirectory(prefix="npu-lease-") as directory:
         verify_recovery(kill_daemon=False)
         daemon = verify_recovery(kill_daemon=True)
 
+        second_socket = pathlib.Path(directory) / "second.sock"
+        duplicate = subprocess.run(
+            [BIN, "--socket", str(second_socket), "daemon"], capture_output=True, text=True, timeout=5,
+        )
+        assert duplicate.returncode == 1 and "another npu-lease daemon" in duplicate.stderr
+        assert not second_socket.exists()
+        print("PASS a second socket cannot start another host daemon", flush=True)
+
+        holder = subprocess.Popen(cli + ["run", "--ids", str(first), "--wait", "--", "sleep", "30"])
+        children.append(holder)
+        until(lambda: status()[str(first)]["state"] == "leased")
+        timed = run("run", "--ids", str(first), "--wait-timeout", "0.3", "--", "true",
+                    capture_output=True)
+        assert timed.returncode == 1 and "lease wait timed out" in timed.stderr
+        waiter = subprocess.Popen(cli + ["run", "--ids", str(first), "--wait", "--", "true"])
+        children.append(waiter)
+
+        def queued():
+            details = json.loads(run("status", "--queue", capture_output=True, check=True).stdout)
+            return any(row["pid"] == waiter.pid and row["ids"] == [first] for row in details["queued"])
+
+        until(queued)
+        draining = json.loads(run("drain", capture_output=True, check=True).stdout)
+        assert draining["draining"] and draining["reserved_devices"] == 1
+        assert waiter.wait(timeout=5) == 1
+        blocked = run("run", "--ids", str(second), "--", "true", capture_output=True)
+        assert blocked.returncode == 1 and "daemon is draining" in blocked.stderr
+        assert status()[str(first)]["state"] == "leased"
+        run("resume", check=True)
+        run("run", "--num", "1", "--wait-timeout", "10", "--", "true", check=True)
+        holder.terminate()
+        assert holder.wait(timeout=5) == -signal.SIGTERM
+        print("PASS wait timeout, queue status, drain and resume", flush=True)
+
+        idle_now = [int(device) for device, row in status().items() if row["state"] == "idle"]
+        assert idle_now, "external workload check requires an idle device"
+        second = idle_now[-1]
         marker = pathlib.Path(directory) / "external-ready"
         external = subprocess.Popen(
             [sys.executable, "-c", ACL, str(marker)],
